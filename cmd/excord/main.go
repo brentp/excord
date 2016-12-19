@@ -28,7 +28,6 @@ type cliarg struct {
 	CoveragePrefix    string  `arg:"-c,required,help:prefix path to write coverage files"`
 	ExcludeFlag       uint16  `arg:"-F"`
 	MinMappingQuality uint8   `arg:"-Q"`
-	Zeros             bool    `arg:"-Z,help:write zero coverage intervals in reference and sequence coverge"`
 	Fasta             string  `arg:"-f,required,help:path to fasta file. used to check for mismatches"`
 	BamPath           string  `arg:"positional,required"`
 	Region            string  `arg:"positional,required"`
