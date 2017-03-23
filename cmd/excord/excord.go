@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
-
-	"go4.org/sort"
 
 	arg "github.com/alexflint/go-arg"
 	"github.com/biogo/hts/sam"
@@ -25,11 +23,11 @@ import (
 const minAlignSize = 30
 
 type cliarg struct {
-	CoveragePrefix    string  `arg:"-c,required,help:prefix path to write coverage files"`
+	Prefix            string  `arg:"-p,help:prefix for reference files. if not given they are not written"`
 	ExcludeFlag       uint16  `arg:"-F"`
 	MinMappingQuality uint8   `arg:"-Q"`
-	Fasta             string  `arg:"-f,required,help:path to fasta file. used to check for mismatches"`
 	BamPath           string  `arg:"positional,required"`
+	Fasta             string  `arg:"-f,required,help:path to fasta file. used to check for mismatches"`
 	Region            string  `arg:"positional,required"`
 	templateLenMean   float64 `arg:"-"`
 	templateLenSD     float64 `arg:"-"`
@@ -73,6 +71,13 @@ type interval struct {
 	end   int
 }
 
+func boolStr(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
 // called from writeDiscordant. We've collected the reads and SA tags into slices, now go through all cases and check for problems.
 func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, opts *cliarg) []*interval {
 	var refs []*interval
@@ -83,7 +88,7 @@ func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, opts *cliar
 				l, r = r, l
 			}
 			if discordantSA(l, r, opts) {
-				fmt.Fprintf(fh, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t-1\n", stripChr(l.Chrom), l.Pos, l.End(), l.Strand, stripChr(r.Chrom), r.Pos, r.End(), r.Strand)
+				fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t-1\n", stripChr(l.Chrom), l.Pos, l.End(), boolStr(l.Strand), stripChr(r.Chrom), r.Pos, r.End(), boolStr(r.Strand))
 			} else if cmp == 0 && bytes.Equal(r.Chrom, []byte(chrom)) {
 				refs = append(refs, &interval{r.Chrom, l.Pos, r.End()})
 
@@ -165,7 +170,6 @@ func writeDiscordant(r *sam.Record, fh io.Writer, opts *cliarg, m map[string][]*
 				fmt.Fprintf(fh, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t0\n", sstripChr(r.MateRef.Name()), mateStart, mateEnd, mateFlag, sstripChr(r.Ref.Name()), start, r.End(), r.Strand())
 			}
 		}
-
 		// for each tag in this pair we see if it is
 		var asas, bsas []*bigly.SA
 		if pt, ok := r.Tag([]byte{'S', 'A'}); ok {
@@ -257,9 +261,9 @@ func writeSplitter(r *sam.Record, fh io.Writer) int {
 		cmp := bytes.Compare(a.Chrom, b.Chrom)
 		// always output the left-most first.
 		if cmp < 0 || cmp == 0 && a.Pos < b.Pos {
-			fmt.Fprintf(fh, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\n", stripChr(a.Chrom), a.Pos, a.End(), a.Strand, b.Chrom, b.Pos, b.End(), b.Strand, len(tags)-1)
+			fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", stripChr(a.Chrom), a.Pos, a.End(), boolStr(a.Strand), b.Chrom, b.Pos, b.End(), boolStr(b.Strand), len(tags)-1)
 		} else {
-			fmt.Fprintf(fh, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\n", stripChr(b.Chrom), b.Pos, b.End(), b.Strand, a.Chrom, a.Pos, a.End(), a.Strand, len(tags)-1)
+			fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", stripChr(b.Chrom), b.Pos, b.End(), boolStr(b.Strand), a.Chrom, a.Pos, a.End(), boolStr(a.Strand), len(tags)-1)
 		}
 	}
 	return len(tags)
@@ -362,24 +366,25 @@ func main() {
 	}
 
 	stats := covmed.BamInsertSizes(b.Reader, 5e5)
+	b.Reader.Omit(0)
 	cli.templateLenMean, cli.templateLenSD = stats.TemplateMean, stats.TemplateSD
 	cli.medianReadLength = stats.ReadLengthMedian
 
-	// this rcov array holds the pair coverage in even interval-numbered slots and ref coverage in odd.
-	rcov, err := uint16mm.Create(cli.CoveragePrefix+"rp.bin", 2*int64(cLen))
-	pcheck(err)
+	if cli.Prefix != "" && !strings.HasSuffix(cli.Prefix, "/") && !strings.HasSuffix(cli.Prefix, ".") {
+		cli.Prefix += "."
+	}
+
+	var rcov *uint16mm.Slice
+
+	if cli.Prefix != "" {
+		// this rcov array holds the pair coverage in even interval-numbered slots and ref coverage in odd.
+		rcov, err = uint16mm.Create(cli.Prefix+"rp.bin", 2*int64(cLen))
+		pcheck(err)
+		defer rcov.Close()
+	}
 
 	fasta, err := faidx.New(cli.Fasta)
 	pcheck(err)
-
-	f, err := os.Create("excord.cpu.pprof")
-	if err != nil {
-		panic(err)
-	}
-	pprof.StartCPUProfile(f)
-	defer pprof.StopCPUProfile()
-
-	defer rcov.Close()
 
 	fh := bufio.NewWriter(os.Stdout)
 
@@ -418,10 +423,12 @@ func main() {
 		}
 		writeSplitter(b, fh)
 		refs := writeDiscordant(b, fh, cli, m)
-		if refs != nil {
+		if refs != nil && rcov != nil {
 			writeRefIntervals(refs, rcov)
 		}
-		writeReferenceCoverage(b, fasta, rcov, cli)
+		if rcov != nil {
+			writeReferenceCoverage(b, fasta, rcov, cli)
+		}
 	}
 	pcheck(it.Error())
 	fh.Flush()
