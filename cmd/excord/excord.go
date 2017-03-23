@@ -6,32 +6,34 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 
 	arg "github.com/alexflint/go-arg"
+	"github.com/biogo/hts/bam"
 	"github.com/biogo/hts/sam"
 	"github.com/brentp/bigly"
 	"github.com/brentp/bigly/bamat"
 	"github.com/brentp/faidx"
 	"github.com/brentp/goleft/covmed"
 	"github.com/brentp/mmslice/uint16mm"
+	"github.com/brentp/xopen"
 )
 
 const minAlignSize = 30
 
 type cliarg struct {
-	Prefix            string  `arg:"-p,help:prefix for reference files. if not given they are not written"`
-	ExcludeFlag       uint16  `arg:"-F"`
-	MinMappingQuality uint8   `arg:"-Q"`
-	BamPath           string  `arg:"positional,required"`
-	Fasta             string  `arg:"-f,required,help:path to fasta file. used to check for mismatches"`
-	Region            string  `arg:"positional,required"`
-	templateLenMean   float64 `arg:"-"`
-	templateLenSD     float64 `arg:"-"`
-	medianReadLength  float64 `arg:"-"`
+	Prefix             string  `arg:"-p,help:prefix for reference files. if not given they are not written"`
+	ExcludeFlag        uint16  `arg:"-F"`
+	MinMappingQuality  uint8   `arg:"-Q"`
+	DiscordantDistance int     `arg:"-d,help:distance at which mates are considered discordant. if not provided it is calcuated from data"`
+	Fasta              string  `arg:"-f,required,help:path to fasta file. used to check for mismatches"`
+	BamPath            string  `arg:"positional,required"`
+	Region             string  `arg:"positional"`
+	medianReadLength   float64 `arg:"-"`
 }
 
 func (c cliarg) Version() string {
@@ -79,7 +81,7 @@ func boolStr(b bool) string {
 }
 
 // called from writeDiscordant. We've collected the reads and SA tags into slices, now go through all cases and check for problems.
-func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, opts *cliarg) []*interval {
+func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, discordantDistance int) []*interval {
 	var refs []*interval
 	for _, l := range lefts {
 		for _, r := range rights {
@@ -87,7 +89,7 @@ func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, opts *cliar
 			if cmp > 0 || cmp == 0 && r.Pos < l.Pos {
 				l, r = r, l
 			}
-			if discordantSA(l, r, opts) {
+			if discordantSA(l, r, discordantDistance) {
 				fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t-1\n", stripChr(l.Chrom), l.Pos, l.End(), boolStr(l.Strand), stripChr(r.Chrom), r.Pos, r.End(), boolStr(r.Strand))
 			} else if cmp == 0 && bytes.Equal(r.Chrom, []byte(chrom)) {
 				refs = append(refs, &interval{r.Chrom, l.Pos, r.End()})
@@ -106,15 +108,15 @@ func writeRefIntervals(refs []*interval, rpair *uint16mm.Slice) {
 	}
 }
 
-func discordantSA(a, b *bigly.SA, opts *cliarg) bool {
+func discordantSA(a, b *bigly.SA, discordantDistance int) bool {
 	var p1, p2 int
 	if a.Pos < b.Pos {
 		p1, p2 = a.Pos, b.End()
 	} else {
 		p1, p2 = b.Pos, a.End()
 	}
-	d := float64(iabs(p1 - p2))
-	return d > opts.templateLenMean+5*opts.templateLenSD
+	d := iabs(p1 - p2)
+	return d > discordantDistance
 }
 
 func getMateEnd(r *sam.Record, opts *cliarg) int {
@@ -155,7 +157,7 @@ func writeDiscordant(r *sam.Record, fh io.Writer, opts *cliarg, m map[string][]*
 
 	if r.Start() > r.MatePos {
 		// we find a discordant pair directly.
-		if r.Ref.ID() != r.MateRef.ID() || discordantByDistance(r, opts) {
+		if r.Ref.ID() != r.MateRef.ID() || discordantByDistance(r, opts.DiscordantDistance) {
 			start := r.Start()
 			mateStart, mateEnd := r.MatePos, getMateEnd(r, opts)
 			mateFlag := 1
@@ -197,7 +199,7 @@ func writeDiscordant(r *sam.Record, fh io.Writer, opts *cliarg, m map[string][]*
 			}
 			bsas = []*bigly.SA{&bigly.SA{Chrom: []byte(r.MateRef.Name()), Pos: r.MatePos, Cigar: v[3:]}}
 		}
-		return writeSAs(r.Ref.Name(), asas, bsas, fh, opts)
+		return writeSAs(r.Ref.Name(), asas, bsas, fh, opts.DiscordantDistance)
 	}
 	if r.MateRef.ID() != r.Ref.ID() {
 		return
@@ -269,9 +271,9 @@ func writeSplitter(r *sam.Record, fh io.Writer) int {
 	return len(tags)
 }
 
-func discordantByDistance(r *sam.Record, opts *cliarg) bool {
-	d := float64(iabs(r.TempLen))
-	return d > opts.templateLenMean+5*opts.templateLenSD
+func discordantByDistance(r *sam.Record, discordantDistance int) bool {
+	d := iabs(r.TempLen)
+	return d > discordantDistance
 }
 
 func recEnd(r *sam.Record, f *faidx.Faidx) int {
@@ -308,7 +310,7 @@ func recEnd(r *sam.Record, f *faidx.Faidx) int {
 // or softclips are evidence for reference. The insert between reads with an insert size within
 // 2SDs of the mean is also evidence for reference.
 // If the pairs are discordant, it returns false if the interval is shorter than minAlignSize
-func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Slice, opts *cliarg) bool {
+func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Slice, discordantDistance int) bool {
 	ses := bigly.RefPieces(r.Pos, r.Cigar)
 	n := 0
 	for i := 0; i < len(ses); i += 2 {
@@ -331,7 +333,7 @@ func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Sl
 		return true
 	}
 
-	if discordantByDistance(r, opts) {
+	if discordantByDistance(r, discordantDistance) {
 		return true
 	}
 
@@ -347,10 +349,53 @@ func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Sl
 	return true
 }
 
+func stdinMain(cli *cliarg) int {
+	if cli.Prefix != "" {
+		panic("excord: cant specify prefix without region")
+	}
+	if !xopen.IsStdin() {
+		panic("excord: bam streamed to sdin when no region is specified")
+	}
+	if cli.DiscordantDistance == 0 {
+		panic("excord: when reading from stdin, you must provide a discordant distance")
+	}
+
+	m := make(map[string][]*bigly.SA, 1e5)
+	br, err := bam.NewReader(os.Stdin, 2)
+	pcheck(err)
+	fh := bufio.NewWriter(os.Stdout)
+	for {
+		b, err := br.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			panic(err)
+		}
+		if uint16(b.Flags)&cli.ExcludeFlag != 0 {
+			continue
+		}
+		if b.MapQ < cli.MinMappingQuality {
+			continue
+		}
+		writeSplitter(b, fh)
+		writeDiscordant(b, fh, cli, m)
+	}
+	fh.Flush()
+
+	return 0
+}
+
 func main() {
 	cli := &cliarg{ExcludeFlag: uint16(sam.Unmapped | sam.QCFail | sam.Duplicate),
 		MinMappingQuality: 1}
 	arg.MustParse(cli)
+	log.Println(cli.Region, cli.BamPath)
+
+	if cli.Region == "" {
+		os.Exit(stdinMain(cli))
+	}
+
 	chromse := strings.Split(cli.Region, ":")
 	b, err := bamat.New(cli.BamPath)
 	pcheck(err)
@@ -365,10 +410,11 @@ func main() {
 		panic(fmt.Sprintf("didn't find chromosome: %s\n", chrom))
 	}
 
-	stats := covmed.BamInsertSizes(b.Reader, 5e5)
-	b.Reader.Omit(0)
-	cli.templateLenMean, cli.templateLenSD = stats.TemplateMean, stats.TemplateSD
-	cli.medianReadLength = stats.ReadLengthMedian
+	if cli.DiscordantDistance == 0 {
+		stats := covmed.BamInsertSizes(b.Reader, 5e5)
+		b.Reader.Omit(0)
+		cli.DiscordantDistance = int(stats.TemplateMean + 5*stats.TemplateSD)
+	}
 
 	if cli.Prefix != "" && !strings.HasSuffix(cli.Prefix, "/") && !strings.HasSuffix(cli.Prefix, ".") {
 		cli.Prefix += "."
@@ -427,7 +473,7 @@ func main() {
 			writeRefIntervals(refs, rcov)
 		}
 		if rcov != nil {
-			writeReferenceCoverage(b, fasta, rcov, cli)
+			writeReferenceCoverage(b, fasta, rcov, cli.DiscordantDistance)
 		}
 	}
 	pcheck(it.Error())
