@@ -30,14 +30,14 @@ type cliarg struct {
 	ExcludeFlag        uint16  `arg:"-F"`
 	MinMappingQuality  uint8   `arg:"-Q"`
 	DiscordantDistance int     `arg:"-d,help:distance at which mates are considered discordant. if not provided it is calcuated from data"`
-	Fasta              string  `arg:"-f,required,help:path to fasta file. used to check for mismatches"`
+	Fasta              string  `arg:"-f,help:path to fasta file. used to check for mismatches"`
 	BamPath            string  `arg:"positional,required"`
 	Region             string  `arg:"positional"`
 	medianReadLength   float64 `arg:"-"`
 }
 
 func (c cliarg) Version() string {
-	return "excord 0.1.1"
+	return "excord 0.2.0"
 }
 
 func pcheck(e error) {
@@ -100,10 +100,10 @@ func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, discordantD
 	return refs
 }
 
-func writeRefIntervals(refs []*interval, rpair *uint16mm.Slice) {
+func writeRefIntervals(refs []*interval, pcov *uint16mm.Slice) {
 	for _, i := range refs {
 		for p := i.start; p < i.end; p++ {
-			rpair.A[2*p]++
+			pcov.A[p]++
 		}
 	}
 }
@@ -310,7 +310,7 @@ func recEnd(r *sam.Record, f *faidx.Faidx) int {
 // or softclips are evidence for reference. The insert between reads with an insert size within
 // 2SDs of the mean is also evidence for reference.
 // If the pairs are discordant, it returns false if the interval is shorter than minAlignSize
-func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Slice, discordantDistance int) bool {
+func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Slice, pcov *uint16mm.Slice, discordantDistance int) bool {
 	ses := bigly.RefPieces(r.Pos, r.Cigar)
 	n := 0
 	for i := 0; i < len(ses); i += 2 {
@@ -326,7 +326,7 @@ func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Sl
 		s, e := ses[i], ses[i+1]
 		// iterate backward to remove boundschecks
 		for p := e - 1; p >= s; p-- {
-			rcov.A[2*p+1]++
+			rcov.A[p]++
 		}
 	}
 	if r.Flags&sam.Paired != sam.Paired || r.Ref.ID() != r.MateRef.ID() || r.Flags&sam.Secondary == sam.Secondary {
@@ -337,13 +337,12 @@ func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Sl
 		return true
 	}
 
-	rpair := rcov
 	// pair coverage we fill from the start of left read.
 	if r.Start() > r.MatePos {
 		s, e := r.MatePos, recEnd(r, fasta)
 		// iterate backward to remove boundschecks
 		for p := e - 1; p >= s; p-- {
-			rpair.A[2*p]++
+			pcov.A[p]++
 		}
 	}
 	return true
@@ -361,7 +360,7 @@ func stdinMain(cli *cliarg) int {
 	}
 
 	m := make(map[string][]*bigly.SA, 1e5)
-	br, err := bam.NewReader(os.Stdin, 2)
+	br, err := bam.NewReader(bufio.NewReader(os.Stdin), 2)
 	pcheck(err)
 	fh := bufio.NewWriter(os.Stdout)
 	for {
@@ -414,23 +413,31 @@ func main() {
 		stats := covmed.BamInsertSizes(b.Reader, 5e5)
 		b.Reader.Omit(0)
 		cli.DiscordantDistance = int(stats.TemplateMean + 5*stats.TemplateSD)
+		log.Printf("using distance: %d", cli.DiscordantDistance)
 	}
 
 	if cli.Prefix != "" && !strings.HasSuffix(cli.Prefix, "/") && !strings.HasSuffix(cli.Prefix, ".") {
 		cli.Prefix += "."
 	}
 
-	var rcov *uint16mm.Slice
+	var rcov, pcov *uint16mm.Slice
 
 	if cli.Prefix != "" {
 		// this rcov array holds the pair coverage in even interval-numbered slots and ref coverage in odd.
-		rcov, err = uint16mm.Create(cli.Prefix+"rp.bin", 2*int64(cLen))
+		rcov, err = uint16mm.Create(cli.Prefix+"read.bin", int64(cLen))
 		pcheck(err)
 		defer rcov.Close()
+		pcov, err = uint16mm.Create(cli.Prefix+"pair.bin", int64(cLen))
+		pcheck(err)
+		defer pcov.Close()
 	}
 
-	fasta, err := faidx.New(cli.Fasta)
-	pcheck(err)
+	var fasta *faidx.Faidx
+
+	if cli.Fasta != "" {
+		fasta, err = faidx.New(cli.Fasta)
+		pcheck(err)
+	}
 
 	fh := bufio.NewWriter(os.Stdout)
 
@@ -473,7 +480,7 @@ func main() {
 			writeRefIntervals(refs, rcov)
 		}
 		if rcov != nil {
-			writeReferenceCoverage(b, fasta, rcov, cli.DiscordantDistance)
+			writeReferenceCoverage(b, fasta, rcov, pcov, cli.DiscordantDistance)
 		}
 	}
 	pcheck(it.Error())
