@@ -36,6 +36,68 @@ type cliarg struct {
 	medianReadLength   float64 `arg:"-"`
 }
 
+type bedPE struct {
+	c1      string
+	s1, e1  int
+	strand1 int8
+
+	c2      string
+	s2, e2  int
+	strand2 int8
+
+	iType int
+}
+
+type excord struct {
+	readCov *uint16mm.Slice
+	pairCov *uint16mm.Slice
+	altMask []bool
+
+	f io.Writer
+}
+
+func newExcord(chromLen int, prefix string) *excord {
+	e := &excord{altMask: make([]bool, chromLen)}
+	rcov, err := uint16mm.Create(prefix+"read.bin", int64(chromLen))
+	pcheck(err)
+	pcov, err := uint16mm.Create(prefix+"pair.bin", int64(chromLen))
+	pcheck(err)
+	e.readCov = rcov
+	e.pairCov = pcov
+	e.f = bufio.NewWriter(e.f)
+	return e
+}
+
+func (e *excord) Close() error {
+	if b, ok := e.f.(*bufio.Writer); ok {
+		b.Flush()
+	}
+	if e.readCov != nil {
+		e.readCov.Close()
+		return e.pairCov.Close()
+	}
+	return nil
+}
+
+func (e *excord) WriteAlt(b *bedPE) error {
+	_, err := fmt.Fprintf(e.f, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\n", b.c1, b.s1, b.e1, b.strand1, b.c2, b.s2, b.e2, b.strand2, b.iType)
+	return err
+}
+
+func (e *excord) updatePairCoverage(start, end int) {
+	A := e.pairCov.A
+	for p := end - 1; p >= start; p-- {
+		A[p]++
+	}
+}
+
+func (e *excord) updateReadCoverage(start, end int) {
+	A := e.readCov.A
+	for p := end - 1; p >= start; p-- {
+		A[p]++
+	}
+}
+
 func (c cliarg) Version() string {
 	return "excord 0.2.0"
 }
@@ -73,15 +135,15 @@ type interval struct {
 	end   int
 }
 
-func boolStr(b bool) string {
+func intStrand(b bool) int8 {
 	if b {
-		return "1"
+		return 1
 	}
-	return "0"
+	return -1
 }
 
 // called from writeDiscordant. We've collected the reads and SA tags into slices, now go through all cases and check for problems.
-func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, discordantDistance int) []*interval {
+func writeSAs(chrom string, lefts, rights []*bigly.SA, ex *excord, discordantDistance int) []*interval {
 	var refs []*interval
 	for _, l := range lefts {
 		for _, r := range rights {
@@ -90,7 +152,9 @@ func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, discordantD
 				l, r = r, l
 			}
 			if discordantSA(l, r, discordantDistance) {
-				fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t-1\n", stripChr(l.Chrom), l.Pos, l.End(), boolStr(l.Strand), stripChr(r.Chrom), r.Pos, r.End(), boolStr(r.Strand))
+				b := bedPE{string(stripChr(l.Chrom)), l.Pos, l.End(), intStrand(l.Strand), string(stripChr(r.Chrom)), r.Pos, r.End(), intStrand(r.Strand), -1}
+				pcheck(ex.WriteAlt(&b))
+				//fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t-1\n", stripChr(l.Chrom), l.Pos, l.End(), boolStr(l.Strand), stripChr(r.Chrom), r.Pos, r.End(), boolStr(r.Strand))
 			} else if cmp == 0 && bytes.Equal(r.Chrom, []byte(chrom)) {
 				refs = append(refs, &interval{r.Chrom, l.Pos, r.End()})
 
@@ -100,11 +164,9 @@ func writeSAs(chrom string, lefts, rights []*bigly.SA, fh io.Writer, discordantD
 	return refs
 }
 
-func writeRefIntervals(refs []*interval, pcov *uint16mm.Slice) {
+func writeRefIntervals(refs []*interval, ex *excord) {
 	for _, i := range refs {
-		for p := i.start; p < i.end; p++ {
-			pcov.A[p]++
-		}
+		ex.updatePairCoverage(i.start, i.end)
 	}
 }
 
@@ -146,7 +208,7 @@ const bad = sam.Duplicate | sam.Secondary | sam.Supplementary
 // may be concordant and some discordant. We return concordant intervals from this function to be increment the
 // reference counts.
 // Only uses: paired, primary, non-dup, non-supplement reads
-func writeDiscordant(r *sam.Record, fh io.Writer, opts *cliarg, m map[string][]*bigly.SA) (refs []*interval) {
+func writeDiscordant(r *sam.Record, ex *excord, opts *cliarg, m map[string][]*bigly.SA) (refs []*interval) {
 	// we are Paired, not dup or secondary and we are the right-most read on the same chrom.
 	if r.Flags&bad != 0 || r.Flags&sam.Paired != sam.Paired {
 		return
@@ -160,16 +222,18 @@ func writeDiscordant(r *sam.Record, fh io.Writer, opts *cliarg, m map[string][]*
 		if r.Ref.ID() != r.MateRef.ID() || discordantByDistance(r, opts.DiscordantDistance) {
 			start := r.Start()
 			mateStart, mateEnd := r.MatePos, getMateEnd(r, opts)
-			mateFlag := 1
+			mateFlag := int8(1)
 			if r.Flags&sam.MateReverse == sam.MateReverse {
 				mateFlag = -1
 			}
 			chrom, mateChrom := r.Ref.ID(), r.MateRef.ID()
 			// always output left-most mate first.
 			if chrom < mateChrom || chrom == mateChrom && start < mateStart {
-				fmt.Fprintf(fh, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t0\n", sstripChr(r.Ref.Name()), start, r.End(), r.Strand(), sstripChr(r.MateRef.Name()), mateStart, mateEnd, mateFlag)
+				b := bedPE{sstripChr(r.Ref.Name()), start, r.End(), r.Strand(), sstripChr(r.MateRef.Name()), mateStart, mateEnd, mateFlag, 0}
+				ex.WriteAlt(&b)
 			} else {
-				fmt.Fprintf(fh, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t0\n", sstripChr(r.MateRef.Name()), mateStart, mateEnd, mateFlag, sstripChr(r.Ref.Name()), start, r.End(), r.Strand())
+				b := bedPE{sstripChr(r.MateRef.Name()), mateStart, mateEnd, mateFlag, sstripChr(r.Ref.Name()), start, r.End(), r.Strand(), 0}
+				ex.WriteAlt(&b)
 			}
 		}
 		// for each tag in this pair we see if it is
@@ -199,7 +263,7 @@ func writeDiscordant(r *sam.Record, fh io.Writer, opts *cliarg, m map[string][]*
 			}
 			bsas = []*bigly.SA{&bigly.SA{Chrom: []byte(r.MateRef.Name()), Pos: r.MatePos, Cigar: v[3:]}}
 		}
-		return writeSAs(r.Ref.Name(), asas, bsas, fh, opts.DiscordantDistance)
+		return writeSAs(r.Ref.Name(), asas, bsas, ex, opts.DiscordantDistance)
 	}
 	if r.MateRef.ID() != r.Ref.ID() {
 		return
@@ -221,7 +285,7 @@ func writeDiscordant(r *sam.Record, fh io.Writer, opts *cliarg, m map[string][]*
 // C:90S30M30S
 // we would order them as they are listed. We would output bedpe intervals
 // for A-B, and B-C
-func writeSplitter(r *sam.Record, fh io.Writer) int {
+func writeSplitter(r *sam.Record, ex *excord) int {
 	if r.Flags&sam.Secondary != 0 && r.Flags&sam.Unmapped != 0 {
 		return 0
 	}
@@ -263,9 +327,14 @@ func writeSplitter(r *sam.Record, fh io.Writer) int {
 		cmp := bytes.Compare(a.Chrom, b.Chrom)
 		// always output the left-most first.
 		if cmp < 0 || cmp == 0 && a.Pos < b.Pos {
-			fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", stripChr(a.Chrom), a.Pos, a.End(), boolStr(a.Strand), b.Chrom, b.Pos, b.End(), boolStr(b.Strand), len(tags)-1)
+			//fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", stripChr(a.Chrom), a.Pos, a.End(), intStrand(a.Strand), b.Chrom, b.Pos, b.End(), intStrand(b.Strand), len(tags)-1)
+			b := bedPE{string(stripChr(a.Chrom)), a.Pos, a.End(), intStrand(a.Strand), string(b.Chrom), b.Pos, b.End(), intStrand(b.Strand), len(tags) - 1}
+			pcheck(ex.WriteAlt(&b))
 		} else {
-			fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", stripChr(b.Chrom), b.Pos, b.End(), boolStr(b.Strand), a.Chrom, a.Pos, a.End(), boolStr(a.Strand), len(tags)-1)
+			//fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", string(stripChr(b.Chrom)), b.Pos, b.End(), intStrand(b.Strand), a.Chrom, a.Pos, a.End(), intStrand(a.Strand), len(tags)-1)
+			b := bedPE{string(stripChr(b.Chrom)), b.Pos, b.End(), intStrand(b.Strand), string(a.Chrom), a.Pos, a.End(), intStrand(a.Strand), len(tags) - 1}
+			pcheck(ex.WriteAlt(&b))
+
 		}
 	}
 	return len(tags)
@@ -310,7 +379,7 @@ func recEnd(r *sam.Record, f *faidx.Faidx) int {
 // or softclips are evidence for reference. The insert between reads with an insert size within
 // 2SDs of the mean is also evidence for reference.
 // If the pairs are discordant, it returns false if the interval is shorter than minAlignSize
-func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Slice, pcov *uint16mm.Slice, discordantDistance int) bool {
+func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, ex *excord, discordantDistance int) bool {
 	ses := bigly.RefPieces(r.Pos, r.Cigar)
 	n := 0
 	for i := 0; i < len(ses); i += 2 {
@@ -325,9 +394,7 @@ func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Sl
 	for i := 0; i < len(ses); i += 2 {
 		s, e := ses[i], ses[i+1]
 		// iterate backward to remove boundschecks
-		for p := e - 1; p >= s; p-- {
-			rcov.A[p]++
-		}
+		ex.updateReadCoverage(s, e)
 	}
 	if r.Flags&sam.Paired != sam.Paired || r.Ref.ID() != r.MateRef.ID() || r.Flags&sam.Secondary == sam.Secondary {
 		return true
@@ -341,9 +408,7 @@ func writeReferenceCoverage(r *sam.Record, fasta *faidx.Faidx, rcov *uint16mm.Sl
 	if r.Start() > r.MatePos {
 		s, e := r.MatePos, recEnd(r, fasta)
 		// iterate backward to remove boundschecks
-		for p := e - 1; p >= s; p-- {
-			pcov.A[p]++
-		}
+		ex.updatePairCoverage(s, e)
 	}
 	return true
 }
@@ -359,10 +424,12 @@ func stdinMain(cli *cliarg) int {
 		panic("excord: when reading from stdin, you must provide a discordant distance")
 	}
 
+	ex := &excord{f: bufio.NewWriter(os.Stdout)}
+	defer ex.Close()
+
 	m := make(map[string][]*bigly.SA, 1e5)
 	br, err := bam.NewReader(bufio.NewReader(os.Stdin), 2)
 	pcheck(err)
-	fh := bufio.NewWriter(os.Stdout)
 	for {
 		b, err := br.Read()
 		if err == io.EOF {
@@ -377,10 +444,9 @@ func stdinMain(cli *cliarg) int {
 		if b.MapQ < cli.MinMappingQuality {
 			continue
 		}
-		writeSplitter(b, fh)
-		writeDiscordant(b, fh, cli, m)
+		writeSplitter(b, ex)
+		writeDiscordant(b, ex, cli, m)
 	}
-	fh.Flush()
 
 	return 0
 }
@@ -420,17 +486,14 @@ func main() {
 		cli.Prefix += "."
 	}
 
-	var rcov, pcov *uint16mm.Slice
+	var ex *excord
 
 	if cli.Prefix != "" {
-		// this rcov array holds the pair coverage in even interval-numbered slots and ref coverage in odd.
-		rcov, err = uint16mm.Create(cli.Prefix+"read.bin", int64(cLen))
-		pcheck(err)
-		defer rcov.Close()
-		pcov, err = uint16mm.Create(cli.Prefix+"pair.bin", int64(cLen))
-		pcheck(err)
-		defer pcov.Close()
+		ex = newExcord(cLen, cli.Prefix)
+	} else {
+		ex = &excord{f: bufio.NewWriter(os.Stdout)}
 	}
+	defer ex.Close()
 
 	var fasta *faidx.Faidx
 
@@ -438,8 +501,6 @@ func main() {
 		fasta, err = faidx.New(cli.Fasta)
 		pcheck(err)
 	}
-
-	fh := bufio.NewWriter(os.Stdout)
 
 	var start, end int
 	if len(chromse) > 1 {
@@ -474,17 +535,16 @@ func main() {
 		if b.MapQ < cli.MinMappingQuality {
 			continue
 		}
-		writeSplitter(b, fh)
-		refs := writeDiscordant(b, fh, cli, m)
-		if refs != nil && rcov != nil {
-			writeRefIntervals(refs, rcov)
+		writeSplitter(b, ex)
+		refs := writeDiscordant(b, ex, cli, m)
+		if refs != nil && ex != nil {
+			writeRefIntervals(refs, ex)
 		}
-		if rcov != nil {
-			writeReferenceCoverage(b, fasta, rcov, pcov, cli.DiscordantDistance)
+		if ex != nil {
+			writeReferenceCoverage(b, fasta, ex, cli.DiscordantDistance)
 		}
 	}
 	pcheck(it.Error())
-	fh.Flush()
 
 }
 
