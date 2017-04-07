@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	arg "github.com/alexflint/go-arg"
 	"github.com/biogo/hts/bam"
@@ -36,6 +37,13 @@ type cliarg struct {
 	medianReadLength   float64 `arg:"-"`
 }
 
+type pairType int
+
+const (
+	idiscordantSA = -1
+	idiscordant   = 0
+)
+
 type bedPE struct {
 	c1      string
 	s1, e1  int
@@ -49,26 +57,127 @@ type bedPE struct {
 }
 
 type excord struct {
-	readCov *uint16mm.Slice
-	pairCov *uint16mm.Slice
-	altMask []bool
+	readCov            *uint16mm.Slice
+	pairCov            *uint16mm.Slice
+	altMask            []bool
+	discordantDistance int
 
-	f io.Writer
+	chrom string
+
+	f  io.Writer
+	ch chan *bedPE
+	wg *sync.WaitGroup
 }
 
-func newExcord(chromLen int, prefix string) *excord {
+func newExcord(chromLen int, prefix string, discordantDistance int) *excord {
 	e := &excord{altMask: make([]bool, chromLen)}
 	rcov, err := uint16mm.Create(prefix+"read.bin", int64(chromLen))
 	pcheck(err)
 	pcov, err := uint16mm.Create(prefix+"pair.bin", int64(chromLen))
 	pcheck(err)
+	e.altMask = make([]bool, int64(chromLen))
 	e.readCov = rcov
 	e.pairCov = pcov
-	e.f = bufio.NewWriter(e.f)
+	e.ch = make(chan *bedPE, 5)
+	e.wg = &sync.WaitGroup{}
+	e.wg.Add(1)
+	e.discordantDistance = discordantDistance
+	e.f = bufio.NewWriter(os.Stdout)
+	go func() {
+		for b := range e.ch {
+			if _, err := fmt.Fprintf(e.f, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\n", b.c1, b.s1, b.e1, b.strand1, b.c2, b.s2, b.e2, b.strand2, b.iType); err != nil {
+				panic(err)
+			}
+			e.updateMask(b)
+		}
+		e.wg.Done()
+	}()
+
 	return e
 }
 
+func (ex *excord) updateMask(b *bedPE) {
+	if ex.discordantDistance == 0 {
+		return
+	}
+	mask := ex.altMask
+	var s, e int
+	if b.iType == idiscordant || b.iType == idiscordantSA {
+		if b.c1 == ex.chrom {
+			if b.strand1 == 1 {
+				s, e = b.e1-10, b.e1+ex.discordantDistance
+			} else {
+				s, e = b.s1-ex.discordantDistance, b.s1+10
+			}
+			if s < 0 {
+				s = 0
+			}
+			if e > len(mask) {
+				e = len(mask)
+			}
+			for i := s; i < e; i++ {
+				mask[i] = true
+			}
+		}
+
+		if b.c2 == ex.chrom {
+			if b.strand2 == 1 {
+				s, e = b.e2-10, b.e2+ex.discordantDistance
+			} else {
+				s, e = b.s2-ex.discordantDistance, b.s2+10
+			}
+			if s < 0 {
+				s = 0
+			}
+			if e > len(mask) {
+				e = len(mask)
+			}
+			for i := s; i < e; i++ {
+				mask[i] = true
+			}
+		}
+
+		return
+	}
+	// ##################################
+	// splitter
+	// ##################################
+	// we just want to be able to check the actual split location so we goleft
+	// +/- 10 of the observed split.
+	// we know that c1:s1-e1 is the left end and c2:s2-e2 is the right
+	//  [xxxxxx]-----------------[xxxxxx]
+	//       *****             *****
+	if b.c1 == ex.chrom {
+		s, e := b.e1-10, b.e1+10
+		if s < 0 {
+			s = 0
+		}
+		if e > len(mask) {
+			e = len(mask)
+		}
+		for i := s; i < e; i++ {
+			mask[i] = true
+		}
+	}
+
+	if b.c2 == ex.chrom {
+		s, e := b.s2-10, b.s2+10
+		if s < 0 {
+			s = 0
+		}
+		if e > len(mask) {
+			e = len(mask)
+		}
+		for i := s; i < e; i++ {
+			mask[i] = true
+		}
+	}
+}
+
 func (e *excord) Close() error {
+	if e.wg != nil {
+		e.wg.Wait()
+	}
 	if b, ok := e.f.(*bufio.Writer); ok {
 		b.Flush()
 	}
@@ -79,9 +188,8 @@ func (e *excord) Close() error {
 	return nil
 }
 
-func (e *excord) WriteAlt(b *bedPE) error {
-	_, err := fmt.Fprintf(e.f, "%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\n", b.c1, b.s1, b.e1, b.strand1, b.c2, b.s2, b.e2, b.strand2, b.iType)
-	return err
+func (e *excord) WriteAlt(b *bedPE) {
+	e.ch <- b
 }
 
 func (e *excord) updatePairCoverage(start, end int) {
@@ -153,8 +261,7 @@ func writeSAs(chrom string, lefts, rights []*bigly.SA, ex *excord, discordantDis
 			}
 			if discordantSA(l, r, discordantDistance) {
 				b := bedPE{string(stripChr(l.Chrom)), l.Pos, l.End(), intStrand(l.Strand), string(stripChr(r.Chrom)), r.Pos, r.End(), intStrand(r.Strand), -1}
-				pcheck(ex.WriteAlt(&b))
-				//fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t-1\n", stripChr(l.Chrom), l.Pos, l.End(), boolStr(l.Strand), stripChr(r.Chrom), r.Pos, r.End(), boolStr(r.Strand))
+				ex.WriteAlt(&b)
 			} else if cmp == 0 && bytes.Equal(r.Chrom, []byte(chrom)) {
 				refs = append(refs, &interval{r.Chrom, l.Pos, r.End()})
 
@@ -258,7 +365,7 @@ func writeDiscordant(r *sam.Record, ex *excord, opts *cliarg, m map[string][]*bi
 		} else if len(bsas) == 0 {
 			v, ok := r.Tag([]byte{'M', 'C'})
 			if !ok {
-				fmt.Fprintf(os.Stderr, "didn't find mate cigar for %s assuming full match\n", r.Name)
+				//fmt.Fprintf(os.Stderr, "didn't find mate cigar for %s assuming full match\n", r.Name)
 				v = []byte(fmt.Sprintf("MCZ%.0fM", opts.medianReadLength))
 			}
 			bsas = []*bigly.SA{&bigly.SA{Chrom: []byte(r.MateRef.Name()), Pos: r.MatePos, Cigar: v[3:]}}
@@ -327,13 +434,11 @@ func writeSplitter(r *sam.Record, ex *excord) int {
 		cmp := bytes.Compare(a.Chrom, b.Chrom)
 		// always output the left-most first.
 		if cmp < 0 || cmp == 0 && a.Pos < b.Pos {
-			//fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", stripChr(a.Chrom), a.Pos, a.End(), intStrand(a.Strand), b.Chrom, b.Pos, b.End(), intStrand(b.Strand), len(tags)-1)
-			b := bedPE{string(stripChr(a.Chrom)), a.Pos, a.End(), intStrand(a.Strand), string(b.Chrom), b.Pos, b.End(), intStrand(b.Strand), len(tags) - 1}
-			pcheck(ex.WriteAlt(&b))
+			b := bedPE{string(stripChr(a.Chrom)), a.Pos, a.End(), intStrand(a.Strand), string(stripChr(b.Chrom)), b.Pos, b.End(), intStrand(b.Strand), len(tags) - 1}
+			ex.WriteAlt(&b)
 		} else {
-			//fmt.Fprintf(fh, "%s\t%d\t%d\t%s\t%s\t%d\t%d\t%s\t%d\n", string(stripChr(b.Chrom)), b.Pos, b.End(), intStrand(b.Strand), a.Chrom, a.Pos, a.End(), intStrand(a.Strand), len(tags)-1)
-			b := bedPE{string(stripChr(b.Chrom)), b.Pos, b.End(), intStrand(b.Strand), string(a.Chrom), a.Pos, a.End(), intStrand(a.Strand), len(tags) - 1}
-			pcheck(ex.WriteAlt(&b))
+			b := bedPE{string(stripChr(b.Chrom)), b.Pos, b.End(), intStrand(b.Strand), string(stripChr(a.Chrom)), a.Pos, a.End(), intStrand(a.Strand), len(tags) - 1}
+			ex.WriteAlt(&b)
 
 		}
 	}
@@ -489,7 +594,8 @@ func main() {
 	var ex *excord
 
 	if cli.Prefix != "" {
-		ex = newExcord(cLen, cli.Prefix)
+		ex = newExcord(cLen, cli.Prefix, cli.DiscordantDistance)
+		ex.chrom = sstripChr(chrom)
 	} else {
 		ex = &excord{f: bufio.NewWriter(os.Stdout)}
 	}
@@ -545,6 +651,15 @@ func main() {
 		}
 	}
 	pcheck(it.Error())
+	s := 0
+	for _, v := range ex.altMask {
+		if v {
+			s++
+		}
+	}
+	log.Printf("bases covered by alts: %d, out of: %d -> %.4f%%", s, cLen, 100*float64(s)/float64(cLen))
+
+	close(ex.ch)
 
 }
 
