@@ -21,6 +21,7 @@ import (
 	"github.com/brentp/faidx"
 	"github.com/brentp/goleft/covmed"
 	"github.com/brentp/mmslice/uint16mm"
+	"github.com/brentp/windowmean"
 	"github.com/brentp/xopen"
 )
 
@@ -67,6 +68,96 @@ type excord struct {
 	f  io.Writer
 	ch chan *bedPE
 	wg *sync.WaitGroup
+}
+
+func cap255(s []uint16) {
+	for i, v := range s {
+		if v == 255 {
+			s[i] = 254
+		} else if v > 255 {
+			s[i] = 255
+		}
+	}
+}
+
+// modified from http://stackoverflow.com/a/4073700
+func round(num uint16, factor uint16) uint16 {
+	v := num + factor/2 - (num-1)%factor
+	if factor&1 != 0 {
+		return v
+	}
+	return v - 1
+}
+
+func _quantize(val uint16) uint16 {
+	if val < 7 {
+		return val
+	}
+	if val < 18 {
+		if val&1 != 0 {
+			return val - 1
+		}
+		return val
+	}
+	if val < 48 {
+		return round(val, 5)
+	}
+	if val < 84 {
+		return round(val, 9)
+	}
+	val = round(val, 17)
+	if val > 255 {
+		return 255
+	}
+	return val
+}
+
+func (ex *excord) quantize() {
+	log.Println("quantizing")
+	if ex.altMask == nil {
+		return
+	}
+	radius := 7
+	ex.pairCov.Flush()
+	ex.readCov.Flush()
+	cap255(ex.pairCov.A)
+	cap255(ex.readCov.A)
+	ex.pairCov.Flush()
+	ex.readCov.Flush()
+
+	rc, err := uint16mm.Open(nil, len(ex.readCov.A))
+	if err != nil {
+		panic(err)
+	}
+	copy(rc.A, ex.readCov.A)
+	tmp := windowmean.WindowMeanUint16(rc.A, radius)
+	copy(rc.A, tmp)
+
+	pc, err := uint16mm.Open(nil, len(ex.pairCov.A))
+	if err != nil {
+		panic(err)
+	}
+	copy(pc.A, ex.pairCov.A)
+	tmp = windowmean.WindowMeanUint16(pc.A, radius)
+	copy(pc.A, tmp)
+
+	ex.pairCov.Flush()
+	ex.readCov.Flush()
+
+	orc, opc := ex.readCov.A, ex.pairCov.A
+
+	for i, m := range ex.altMask {
+		// no quantization if we're in an alt region
+		_ = m
+		/*
+			if m {
+				continue
+			}
+		*/
+		orc[i] = _quantize(rc.A[i])
+		opc[i] = _quantize(pc.A[i])
+	}
+	log.Println("done quantizing")
 }
 
 func newExcord(chromLen int, prefix string, discordantDistance int) *excord {
@@ -651,6 +742,8 @@ func main() {
 		}
 	}
 	pcheck(it.Error())
+	close(ex.ch)
+	ex.wg.Wait()
 	s := 0
 	for _, v := range ex.altMask {
 		if v {
@@ -658,9 +751,7 @@ func main() {
 		}
 	}
 	log.Printf("bases covered by alts: %d, out of: %d -> %.4f%%", s, cLen, 100*float64(s)/float64(cLen))
-
-	close(ex.ch)
-
+	ex.quantize()
 }
 
 func stripChr(chrom []byte) []byte {
