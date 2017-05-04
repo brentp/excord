@@ -19,9 +19,9 @@ import (
 	"github.com/brentp/bigly"
 	"github.com/brentp/bigly/bamat"
 	"github.com/brentp/faidx"
+	"github.com/brentp/go-athenaeum/windowmean"
 	"github.com/brentp/goleft/covmed"
 	"github.com/brentp/mmslice/uint16mm"
-	"github.com/brentp/windowmean"
 	"github.com/brentp/xopen"
 )
 
@@ -160,15 +160,18 @@ func (ex *excord) quantize() {
 	log.Println("done quantizing")
 }
 
-func newExcord(chromLen int, prefix string, discordantDistance int) *excord {
-	e := &excord{altMask: make([]bool, chromLen)}
-	rcov, err := uint16mm.Create(prefix+"read.bin", int64(chromLen))
-	pcheck(err)
-	pcov, err := uint16mm.Create(prefix+"pair.bin", int64(chromLen))
-	pcheck(err)
-	e.altMask = make([]bool, int64(chromLen))
-	e.readCov = rcov
-	e.pairCov = pcov
+func newExcord(chromLen int, prefix string, discordantDistance int, writeRef bool) *excord {
+	e := &excord{}
+	if writeRef {
+		rcov, err := uint16mm.Create(prefix+"read.bin", int64(chromLen))
+
+		pcheck(err)
+		pcov, err := uint16mm.Create(prefix+"pair.bin", int64(chromLen))
+		pcheck(err)
+		e.altMask = make([]bool, int64(chromLen))
+		e.readCov = rcov
+		e.pairCov = pcov
+	}
 	e.ch = make(chan *bedPE, 5)
 	e.wg = &sync.WaitGroup{}
 	e.wg.Add(1)
@@ -183,7 +186,6 @@ func newExcord(chromLen int, prefix string, discordantDistance int) *excord {
 		}
 		e.wg.Done()
 	}()
-
 	return e
 }
 
@@ -298,7 +300,7 @@ func (e *excord) updateReadCoverage(start, end int) {
 }
 
 func (c cliarg) Version() string {
-	return "excord 0.2.0"
+	return "excord 0.2.2"
 }
 
 func pcheck(e error) {
@@ -415,9 +417,14 @@ func writeDiscordant(r *sam.Record, ex *excord, opts *cliarg, m map[string][]*bi
 		return
 	}
 
+	// we know we've already seen the mate so process this one and then look up the mate.
 	if r.Start() > r.MatePos {
-		// we find a discordant pair directly.
-		if r.Ref.ID() != r.MateRef.ID() || discordantByDistance(r, opts.DiscordantDistance) {
+		// duplication signal is -/+ and this r is the right read so it would be plus and mate is -
+		if r.Ref.ID() == r.MateRef.ID() && r.Strand() == 1 && r.Flags&sam.MateReverse != 0 {
+			chr := sstripChr(r.Ref.Name())
+			b := bedPE{chr, r.MatePos, getMateEnd(r, opts), -1, chr, start, r.End(), 1, 0}
+			ex.WriteAlt(&b)
+		} else if r.Ref.ID() != r.MateRef.ID() || discordantByDistance(r, opts.DiscordantDistance) {
 			start := r.Start()
 			mateStart, mateEnd := r.MatePos, getMateEnd(r, opts)
 			mateFlag := int8(1)
@@ -620,11 +627,11 @@ func stdinMain(cli *cliarg) int {
 		panic("excord: when reading from stdin, you must provide a discordant distance")
 	}
 
-	ex := &excord{f: bufio.NewWriter(os.Stdout)}
+	ex := newExcord(0, cli.Prefix, cli.DiscordantDistance, false)
 	defer ex.Close()
 
 	m := make(map[string][]*bigly.SA, 1e5)
-	br, err := bam.NewReader(bufio.NewReader(os.Stdin), 2)
+	br, err := bam.NewReader(bufio.NewReader(os.Stdin), 3)
 	pcheck(err)
 	for {
 		b, err := br.Read()
@@ -643,6 +650,7 @@ func stdinMain(cli *cliarg) int {
 		writeSplitter(b, ex)
 		writeDiscordant(b, ex, cli, m)
 	}
+	close(ex.ch)
 
 	return 0
 }
@@ -685,10 +693,10 @@ func main() {
 	var ex *excord
 
 	if cli.Prefix != "" {
-		ex = newExcord(cLen, cli.Prefix, cli.DiscordantDistance)
+		ex = newExcord(cLen, cli.Prefix, cli.DiscordantDistance, true)
 		ex.chrom = sstripChr(chrom)
 	} else {
-		ex = &excord{f: bufio.NewWriter(os.Stdout)}
+		ex = newExcord(cLen, cli.Prefix, cli.DiscordantDistance, false)
 	}
 	defer ex.Close()
 
