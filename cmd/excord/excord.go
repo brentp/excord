@@ -19,8 +19,7 @@ import (
 	"github.com/brentp/bigly"
 	"github.com/brentp/bigly/bamat"
 	"github.com/brentp/faidx"
-	"github.com/brentp/go-athenaeum/windowmean"
-	"github.com/brentp/goleft/covmed"
+	"github.com/brentp/goleft/covstats"
 	"github.com/brentp/mmslice/uint16mm"
 	"github.com/brentp/xopen"
 )
@@ -60,7 +59,8 @@ type bedPE struct {
 type excord struct {
 	readCov            *uint16mm.Slice
 	pairCov            *uint16mm.Slice
-	altMask            []bool
+	altMask0           []bool
+	altMask1           []bool
 	discordantDistance int
 
 	chrom string
@@ -113,11 +113,12 @@ func _quantize(val uint16) uint16 {
 }
 
 func (ex *excord) quantize() {
-	log.Println("quantizing")
-	if ex.altMask == nil {
+	if ex.altMask0 == nil {
+		log.Println("not quantizing")
 		return
 	}
-	radius := 7
+	log.Println("quantizing")
+	//radius := 7
 	ex.pairCov.Flush()
 	ex.readCov.Flush()
 	cap255(ex.pairCov.A)
@@ -130,30 +131,27 @@ func (ex *excord) quantize() {
 		panic(err)
 	}
 	copy(rc.A, ex.readCov.A)
-	tmp := windowmean.WindowMeanUint16(rc.A, radius)
-	copy(rc.A, tmp)
+	//tmp := windowmean.WindowMeanUint16(rc.A, radius)
+	//copy(rc.A, tmp)
 
 	pc, err := uint16mm.Open(nil, len(ex.pairCov.A))
-	if err != nil {
-		panic(err)
-	}
+	//if err != nil {
+	//j		panic(err)
+	//	}
 	copy(pc.A, ex.pairCov.A)
-	tmp = windowmean.WindowMeanUint16(pc.A, radius)
-	copy(pc.A, tmp)
+	//tmp = windowmean.WindowMeanUint16(pc.A, radius)
+	//copy(pc.A, tmp)
 
 	ex.pairCov.Flush()
 	ex.readCov.Flush()
 
 	orc, opc := ex.readCov.A, ex.pairCov.A
 
-	for i, m := range ex.altMask {
+	for i, m := range ex.altMask1 {
 		// no quantization if we're in an alt region
-		_ = m
-		/*
-			if m {
-				continue
-			}
-		*/
+		if m {
+			continue
+		}
 		orc[i] = _quantize(rc.A[i])
 		opc[i] = _quantize(pc.A[i])
 	}
@@ -168,7 +166,8 @@ func newExcord(chromLen int, prefix string, discordantDistance int, writeRef boo
 		pcheck(err)
 		pcov, err := uint16mm.Create(prefix+"pair.bin", int64(chromLen))
 		pcheck(err)
-		e.altMask = make([]bool, int64(chromLen))
+		e.altMask0 = make([]bool, int64(chromLen))
+		e.altMask1 = make([]bool, int64(chromLen))
 		e.readCov = rcov
 		e.pairCov = pcov
 	}
@@ -193,7 +192,7 @@ func (ex *excord) updateMask(b *bedPE) {
 	if ex.discordantDistance == 0 {
 		return
 	}
-	mask := ex.altMask
+	mask0, mask1 := ex.altMask0, ex.altMask1
 	var s, e int
 	if b.iType == idiscordant || b.iType == idiscordantSA {
 		if b.c1 == ex.chrom {
@@ -205,11 +204,15 @@ func (ex *excord) updateMask(b *bedPE) {
 			if s < 0 {
 				s = 0
 			}
-			if e > len(mask) {
-				e = len(mask)
+			if e > len(mask0) {
+				e = len(mask0)
 			}
 			for i := s; i < e; i++ {
-				mask[i] = true
+				if mask0[i] {
+					mask1[i] = true
+				} else {
+					mask0[i] = true
+				}
 			}
 		}
 
@@ -222,11 +225,15 @@ func (ex *excord) updateMask(b *bedPE) {
 			if s < 0 {
 				s = 0
 			}
-			if e > len(mask) {
-				e = len(mask)
+			if e > len(mask0) {
+				e = len(mask0)
 			}
 			for i := s; i < e; i++ {
-				mask[i] = true
+				if mask0[i] {
+					mask1[i] = true
+				} else {
+					mask0[i] = true
+				}
 			}
 		}
 
@@ -245,11 +252,15 @@ func (ex *excord) updateMask(b *bedPE) {
 		if s < 0 {
 			s = 0
 		}
-		if e > len(mask) {
-			e = len(mask)
+		if e > len(mask0) {
+			e = len(mask0)
 		}
 		for i := s; i < e; i++ {
-			mask[i] = true
+			if mask0[i] {
+				mask1[i] = true
+			} else {
+				mask0[i] = true
+			}
 		}
 	}
 
@@ -258,11 +269,15 @@ func (ex *excord) updateMask(b *bedPE) {
 		if s < 0 {
 			s = 0
 		}
-		if e > len(mask) {
-			e = len(mask)
+		if e > len(mask0) {
+			e = len(mask0)
 		}
 		for i := s; i < e; i++ {
-			mask[i] = true
+			if mask0[i] {
+				mask1[i] = true
+			} else {
+				mask0[i] = true
+			}
 		}
 	}
 }
@@ -422,7 +437,7 @@ func writeDiscordant(r *sam.Record, ex *excord, opts *cliarg, m map[string][]*bi
 		// duplication signal is -/+ and this r is the right read so it would be plus and mate is -
 		if r.Ref.ID() == r.MateRef.ID() && r.Strand() == 1 && r.Flags&sam.MateReverse != 0 {
 			chr := sstripChr(r.Ref.Name())
-			b := bedPE{chr, r.MatePos, getMateEnd(r, opts), -1, chr, start, r.End(), 1, 0}
+			b := bedPE{chr, r.MatePos, getMateEnd(r, opts), -1, chr, r.Start(), r.End(), 1, 0}
 			ex.WriteAlt(&b)
 		} else if r.Ref.ID() != r.MateRef.ID() || discordantByDistance(r, opts.DiscordantDistance) {
 			start := r.Start()
@@ -680,7 +695,7 @@ func main() {
 	}
 
 	if cli.DiscordantDistance == 0 {
-		stats := covmed.BamInsertSizes(b.Reader, 5e5)
+		stats := covstats.BamStats(b.Reader, 5e5)
 		b.Reader.Omit(0)
 		cli.DiscordantDistance = int(stats.TemplateMean + 5*stats.TemplateSD)
 		log.Printf("using distance: %d", cli.DiscordantDistance)
@@ -753,12 +768,20 @@ func main() {
 	close(ex.ch)
 	ex.wg.Wait()
 	s := 0
-	for _, v := range ex.altMask {
+	for _, v := range ex.altMask1 {
 		if v {
 			s++
 		}
 	}
-	log.Printf("bases covered by alts: %d, out of: %d -> %.4f%%", s, cLen, 100*float64(s)/float64(cLen))
+	log.Printf("bases covered by <= 1 alt: %d, out of: %d -> %.4f%%", s, cLen, 100-100*float64(s)/float64(cLen))
+	s = 0
+	for _, v := range ex.altMask0 {
+		if v {
+			s++
+		}
+	}
+
+	log.Printf("bases covered by < 0 alt: %d, out of: %d -> %.4f%%", s, cLen, 100-100*float64(s)/float64(cLen))
 	ex.quantize()
 }
 
