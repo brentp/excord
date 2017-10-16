@@ -408,7 +408,7 @@ func getMateEnd(r *sam.Record, opts *cliarg) int {
 	return r.MatePos + int(opts.medianReadLength)
 }
 
-const bad = sam.Duplicate | sam.Secondary | sam.Supplementary
+const bad = sam.Duplicate | sam.Secondary | sam.Supplementary | sam.QCFail
 
 // output discordant mates to file. The map keeps a history of left mates (lower position) that we've
 // seen that have SA tags. We put the read, and it's SA tags into the map.
