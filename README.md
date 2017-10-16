@@ -4,7 +4,7 @@ excord extracts split and paired-end reads that are possible
 indicators of structural variation. It also outputs reference
 depth.
 
-The output of excord is used as input to [https://github.com/ryanlayer/stix](stix SV index).
+The output of excord is used as input to [stix SV index](https://github.com/ryanlayer/stix)
 
 ## usage
 
