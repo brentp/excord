@@ -1,5 +1,12 @@
-usage
-=====
+# excord
+
+excord extracts split and paired-end reads that are possible 
+indicators of structural variation. It also outputs reference
+depth.
+
+The output of excord is used as input to [https://github.com/ryanlayer/stix](stix SV index).
+
+## usage
 
 By default excord expects stuff from a single chromosome:
 ```
@@ -12,3 +19,8 @@ It's possible to read a bam from stdin and write only the discorants and splitte
 <bam stream> | excord --discordantdistance 500 --fasta $fasta /dev/stdin | bgzip -c > $out
 ```
 It's not possible to write reference coverage with this mode.
+
+
+## Ack
+
+excord is developed as part of the company base2 genomics.
