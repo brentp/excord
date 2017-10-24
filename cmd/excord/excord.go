@@ -31,6 +31,7 @@ type cliarg struct {
 	ExcludeFlag        uint16  `arg:"-F"`
 	MinMappingQuality  uint8   `arg:"-Q"`
 	DiscordantDistance int     `arg:"-d,help:distance at which mates are considered discordant. if not provided it is calcuated from data"`
+	NoQuantize         bool    `arg:"-n,help:do not quantize reference depths (quantizing results in better compression)."`
 	Fasta              string  `arg:"-f,help:path to fasta file. used to check for mismatches"`
 	BamPath            string  `arg:"positional,required"`
 	Region             string  `arg:"positional"`
@@ -315,7 +316,7 @@ func (e *excord) updateReadCoverage(start, end int) {
 }
 
 func (c cliarg) Version() string {
-	return "excord 0.2.2"
+	return "excord 0.2.3"
 }
 
 func pcheck(e error) {
@@ -782,7 +783,9 @@ func main() {
 	}
 
 	log.Printf("bases covered by < 0 alt: %d, out of: %d -> %.4f%%", s, cLen, 100-100*float64(s)/float64(cLen))
-	ex.quantize()
+	if !cli.NoQuantize {
+		ex.quantize()
+	}
 }
 
 func stripChr(chrom []byte) []byte {
