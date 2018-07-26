@@ -316,7 +316,7 @@ func (e *excord) updateReadCoverage(start, end int) {
 }
 
 func (c cliarg) Version() string {
-	return "excord 0.2.3"
+	return "excord 0.2.4"
 }
 
 func pcheck(e error) {
@@ -430,6 +430,10 @@ func writeDiscordant(r *sam.Record, ex *excord, opts *cliarg, m map[string][]*bi
 		return
 	}
 	if r.Start() == r.MatePos && r.Ref.ID() == r.MateRef.ID() {
+		if r.Flags&sam.MateUnmapped == sam.MateUnmapped {
+			// handle paired, but mate unmapped
+			ex.WriteAlt(&bedPE{sstripChr(r.Ref.Name()), r.Start(), r.End(), r.Strand(), "-1", -1, -1, 0, int(r.Flags)})
+		}
 		return
 	}
 
